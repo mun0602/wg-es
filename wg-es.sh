@@ -14,6 +14,37 @@ else
     echo "Docker đã được cài đặt."
 fi
 
+# Kiểm tra xem container wg-easy đã tồn tại chưa
+if docker ps -a --format "table {{.Names}}" | grep -q "wg-easy"; then
+    echo "Phát hiện container wg-easy đã tồn tại!"
+    echo "Bạn có muốn:"
+    echo "1. Thay đổi cấu hình (domain, cổng, mật khẩu)"
+    echo "2. Xóa container cũ và cài đặt lại"
+    echo "3. Thoát"
+    read -p "Chọn lựa chọn (1-3): " choice
+    
+    case $choice in
+        1)
+            echo "Đang dừng và xóa container cũ..."
+            docker stop wg-easy 2>/dev/null
+            docker rm wg-easy 2>/dev/null
+            ;;
+        2)
+            echo "Đang xóa container cũ..."
+            docker stop wg-easy 2>/dev/null
+            docker rm wg-easy 2>/dev/null
+            ;;
+        3)
+            echo "Thoát script."
+            exit 0
+            ;;
+        *)
+            echo "Lựa chọn không hợp lệ. Thoát script."
+            exit 1
+            ;;
+    esac
+fi
+
 # Nhập thông tin từ người dùng
 read -p "Nhập domain hoặc IP cho WG_HOST: " WG_HOST
 read -sp "Nhập mật khẩu (PASSWORD): " PASSWORD
@@ -31,6 +62,7 @@ if [ ! -d "$CONFIG_DIR" ]; then
 fi
 
 # Thực thi lệnh docker run
+echo "Đang khởi chạy wg-easy với cấu hình mới..."
 docker run -d \
   --name=wg-easy \
   -e WG_HOST="$WG_HOST" \
@@ -45,6 +77,13 @@ docker run -d \
   --restart=always \
   weejewel/wg-easy
 
-# Hiển thị đường dẫn truy cập
-echo "Cài đặt và khởi chạy wg-easy hoàn tất!"
-echo "Bạn có thể truy cập tại: http://$WG_HOST:$PORT_TCP"
+# Kiểm tra xem container có chạy thành công không
+if docker ps --format "table {{.Names}}" | grep -q "wg-easy"; then
+    echo "✅ Cài đặt và khởi chạy wg-easy hoàn tất!"
+    echo "🌐 Bạn có thể truy cập tại: http://$WG_HOST:$PORT_TCP"
+    echo "🔑 Mật khẩu: $PASSWORD"
+    echo "📁 Thư mục cấu hình: $CONFIG_DIR"
+else
+    echo "❌ Có lỗi xảy ra khi khởi chạy container. Kiểm tra logs:"
+    docker logs wg-easy
+fi
