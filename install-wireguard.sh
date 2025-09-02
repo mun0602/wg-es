@@ -122,25 +122,122 @@ generate_password_hash() {
     cat > "$temp_script" << 'JSEOF'
 const bcrypt = require('bcryptjs');
 const password = process.argv[2];
-const hash = bcrypt.hashSync(password, 10);
-// Escape $ characters for docker-compose
-console.log(hash.replace(/\$/g, '$$'));
+if (!password) {
+    console.error('Password is required');
+    process.exit(1);
+}
+try {
+    const hash = bcrypt.hashSync(password, 10);
+    console.log(hash);
+} catch (error) {
+    console.error('Error generating hash:', error.message);
+    process.exit(1);
+}
 JSEOF
     
-    # Sử dụng Docker để tạo bcrypt hash
-    PASSWORD_HASH=$(docker run --rm -v "$temp_script:/app/generate_hash.js" ghcr.io/wg-easy/wg-easy:latest node /app/generate_hash.js "$password")
+    # Sử dụng Docker để tạo bcrypt hash với error handling tốt hơn
+    local hash_output
+    local hash_error
+    
+    print_status "Đang chạy Docker container để tạo hash..."
+    hash_output=$(docker run --rm -v "$temp_script:/app/generate_hash.js" ghcr.io/wg-easy/wg-easy:latest node /app/generate_hash.js "$password" 2>&1)
+    local exit_code=$?
     
     # Xóa file tạm
     rm -f "$temp_script"
     
-    if [[ -z "$PASSWORD_HASH" ]]; then
-        print_error "Không thể tạo bcrypt hash cho mật khẩu"
-        print_status "Thử sử dụng mật khẩu plain text (không khuyến nghị)..."
-        PASSWORD_HASH="$password"
-        print_warning "Đang sử dụng mật khẩu plain text. Hãy cập nhật lên bcrypt hash sau."
+    # Kiểm tra kết quả
+    if [[ $exit_code -eq 0 && -n "$hash_output" ]]; then
+        # Lấy dòng cuối cùng làm hash (tránh các thông báo debug)
+        PASSWORD_HASH=$(echo "$hash_output" | tail -n 1 | tr -d '\r\n')
+        
+        # Kiểm tra hash có hợp lệ không (bcrypt hash bắt đầu bằng $2a$, $2b$, hoặc $2y$)
+        if [[ "$PASSWORD_HASH" =~ ^\$2[aby]\$[0-9]{2}\$ ]]; then
+            print_success "Đã tạo bcrypt hash thành công"
+            print_status "Hash preview: ${PASSWORD_HASH:0:25}..."
+            
+            # Kiểm tra độ dài hash (bcrypt hash thường dài 60 ký tự)
+            if [[ ${#PASSWORD_HASH} -eq 60 ]]; then
+                print_success "Hash có độ dài hợp lệ (60 ký tự)"
+            else
+                print_warning "Hash có độ dài bất thường: ${#PASSWORD_HASH} ký tự"
+            fi
+            
+            # KHÔNG escape $ characters - để nguyên hash gốc
+            # Vì wg-easy v14+ cần hash nguyên bản
+            return 0
+        else
+            print_error "Hash không hợp lệ: $PASSWORD_HASH"
+            print_error "Hash phải bắt đầu bằng \$2a\$, \$2b\$, hoặc \$2y\$"
+        fi
     else
-        print_success "Đã tạo bcrypt hash thành công"
-        print_status "Hash: ${PASSWORD_HASH:0:20}..."
+        print_error "Lỗi khi tạo hash:"
+        echo "$hash_output" | while read line; do
+            print_error "  $line"
+        done
+    fi
+    
+    # Fallback: sử dụng plain text password
+    print_warning "Không thể tạo bcrypt hash, sử dụng mật khẩu plain text"
+    print_warning "Điều này có thể gây ra lỗi 'Unauthorized' trong Web UI"
+    print_status "Khuyến nghị: Kiểm tra lại Docker và thử lại"
+    PASSWORD_HASH="$password"
+    return 1
+}
+
+# Test bcrypt hash để đảm bảo hoạt động đúng
+test_password_hash() {
+    local password="$1"
+    local hash="$2"
+    
+    print_status "Đang test bcrypt hash..."
+    
+    # Tạo file test tạm
+    local temp_test="/tmp/test_hash.js"
+    cat > "$temp_test" << 'JSEOF'
+const bcrypt = require('bcryptjs');
+const password = process.argv[2];
+const hash = process.argv[3];
+
+if (!password || !hash) {
+    console.error('Password and hash are required');
+    process.exit(1);
+}
+
+try {
+    const isValid = bcrypt.compareSync(password, hash);
+    if (isValid) {
+        console.log('HASH_VALID');
+        process.exit(0);
+    } else {
+        console.log('HASH_INVALID');
+        process.exit(1);
+    }
+} catch (error) {
+    console.error('Error testing hash:', error.message);
+    process.exit(1);
+}
+JSEOF
+    
+    # Test hash bằng Docker
+    local test_output
+    test_output=$(docker run --rm -v "$temp_test:/app/test_hash.js" ghcr.io/wg-easy/wg-easy:latest node /app/test_hash.js "$password" "$hash" 2>&1)
+    local test_exit_code=$?
+    
+    # Xóa file test tạm
+    rm -f "$temp_test"
+    
+    # Kiểm tra kết quả test
+    if [[ $test_exit_code -eq 0 && "$test_output" == *"HASH_VALID"* ]]; then
+        print_success "Hash test thành công - mật khẩu và hash khớp"
+        return 0
+    else
+        print_error "Hash test thất bại:"
+        echo "$test_output" | while read line; do
+            print_error "  $line"
+        done
+        print_warning "Hash có thể không hoạt động đúng trong Web UI"
+        return 1
     fi
 }
 
@@ -174,6 +271,17 @@ get_user_input() {
     # Tạo bcrypt hash cho mật khẩu
     generate_password_hash "$ADMIN_PASSWORD"
     
+    # Test hash nếu tạo thành công
+    if [[ "$PASSWORD_HASH" != "$ADMIN_PASSWORD" ]]; then
+        print_status "Xác minh hash đã tạo..."
+        if test_password_hash "$ADMIN_PASSWORD" "$PASSWORD_HASH"; then
+            print_success "Hash đã được xác minh và hoạt động đúng"
+        else
+            print_error "Hash không hoạt động đúng, chuyển sang plain text"
+            PASSWORD_HASH="$ADMIN_PASSWORD"
+        fi
+    fi
+    
     # Lấy IP công khai
     print_status "Đang lấy địa chỉ IP công khai..."
     PUBLIC_IP=$(curl -s ifconfig.me || curl -s ipinfo.io/ip || curl -s icanhazip.com)
@@ -189,9 +297,19 @@ get_user_input() {
 create_docker_compose() {
     print_status "Đang tạo file docker-compose.yml..."
     
+    # Debug thông tin
+    print_status "Thông tin cấu hình:"
+    echo "  - Container: ${CONTAINER_NAME}"
+    echo "  - WG Host: ${PUBLIC_IP}"
+    echo "  - WG Port: ${WG_PORT}"
+    echo "  - Web Port: ${WEB_PORT}"
+    echo "  - Password Hash Length: ${#PASSWORD_HASH}"
+    echo "  - Hash Preview: ${PASSWORD_HASH:0:30}..."
+    
     mkdir -p /opt/wireguard
     cd /opt/wireguard
     
+    # Tạo docker-compose.yml với xử lý đặc biệt cho PASSWORD_HASH
     cat > docker-compose.yml << EOF
 services:
   ${CONTAINER_NAME}:
@@ -230,6 +348,23 @@ networks:
 EOF
     
     print_success "File docker-compose.yml đã được tạo tại /opt/wireguard/"
+    
+    # Kiểm tra nội dung file đã tạo
+    print_status "Kiểm tra PASSWORD_HASH trong docker-compose.yml:"
+    if grep -q "PASSWORD_HASH=" docker-compose.yml; then
+        local hash_in_file=$(grep "PASSWORD_HASH=" docker-compose.yml | cut -d'=' -f2)
+        echo "  - Hash trong file: ${hash_in_file:0:30}..."
+        
+        # Kiểm tra hash có bị escape không đúng
+        if [[ "$hash_in_file" == *"\$\$"* ]]; then
+            print_warning "Phát hiện hash bị escape sai (có \$\$), đang sửa..."
+            # Sửa lại hash trong file
+            sed -i "s/PASSWORD_HASH=.*/PASSWORD_HASH=${PASSWORD_HASH}/" docker-compose.yml
+            print_success "Đã sửa hash trong docker-compose.yml"
+        fi
+    else
+        print_error "Không tìm thấy PASSWORD_HASH trong docker-compose.yml"
+    fi
 }
 
 # Cấu hình firewall
@@ -540,6 +675,85 @@ show_completion_info() {
     echo
 }
 
+# Kiểm tra và xóa cài đặt cũ nếu cần
+check_and_cleanup_existing() {
+    print_status "Kiểm tra cài đặt WireGuard hiện có..."
+    
+    # Kiểm tra xem có container WireGuard nào đang chạy không
+    EXISTING_CONTAINERS=$(docker ps -a --filter "ancestor=ghcr.io/wg-easy/wg-easy:latest" --format "{{.Names}}" 2>/dev/null || true)
+    
+    if [[ -n "$EXISTING_CONTAINERS" ]]; then
+        echo
+        print_warning "Phát hiện các container WireGuard đã tồn tại:"
+        echo "$EXISTING_CONTAINERS" | while read container; do
+            echo "  - $container"
+        done
+        echo
+        echo "Lựa chọn:"
+        echo "1) Xóa tất cả container cũ và cài đặt lại hoàn toàn"
+        echo "2) Giữ nguyên và thoát (không cài đặt)"
+        echo "3) Tiếp tục cài đặt với tên container khác"
+        echo
+        read -p "Nhập lựa chọn (1-3): " cleanup_choice
+        
+        case $cleanup_choice in
+            1)
+                print_status "Đang xóa tất cả container và dữ liệu WireGuard cũ..."
+                
+                # Dừng và xóa tất cả container WireGuard
+                echo "$EXISTING_CONTAINERS" | while read container; do
+                    if [[ -n "$container" ]]; then
+                        print_status "Đang xóa container: $container"
+                        docker stop "$container" 2>/dev/null || true
+                        docker rm "$container" 2>/dev/null || true
+                    fi
+                done
+                
+                # Xóa volume
+                read -p "Bạn có muốn xóa tất cả dữ liệu cấu hình cũ (volumes) không? (y/N): " -n 1 -r
+                echo
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    docker volume ls --filter "name=wg-easy" --format "{{.Name}}" | while read volume; do
+                        if [[ -n "$volume" ]]; then
+                            print_status "Đang xóa volume: $volume"
+                            docker volume rm "$volume" 2>/dev/null || true
+                        fi
+                    done
+                    
+                    # Xóa thư mục cấu hình
+                    if [[ -d "/opt/wireguard" ]]; then
+                        read -p "Bạn có muốn xóa thư mục cấu hình /opt/wireguard không? (y/N): " -n 1 -r
+                        echo
+                        if [[ $REPLY =~ ^[Yy]$ ]]; then
+                            rm -rf /opt/wireguard
+                            print_success "Đã xóa thư mục cấu hình"
+                        fi
+                    fi
+                    
+                    print_success "Đã xóa tất cả dữ liệu cũ"
+                fi
+                
+                print_success "Đã dọn dẹp hoàn tất, tiếp tục cài đặt mới..."
+                return 0
+                ;;
+            2)
+                print_status "Giữ nguyên cài đặt hiện tại và thoát"
+                exit 0
+                ;;
+            3)
+                print_status "Tiếp tục cài đặt với cấu hình mới..."
+                return 0
+                ;;
+            *)
+                print_error "Lựa chọn không hợp lệ"
+                exit 1
+                ;;
+        esac
+    else
+        print_success "Không phát hiện cài đặt WireGuard cũ"
+    fi
+}
+
 # Hàm main
 main() {
     echo
@@ -548,10 +762,21 @@ main() {
     echo "================================================"
     echo
     
+    # Kiểm tra quyền và hệ điều hành trước
     check_root
     check_os
+    
+    # Kiểm tra và cài đặt Docker ngay từ đầu
+    print_status "Bước 1: Kiểm tra và cài đặt Docker"
     install_docker
     install_docker_compose
+    
+    # Kiểm tra và dọn dẹp cài đặt cũ nếu cần
+    print_status "Bước 2: Kiểm tra cài đặt hiện có"
+    check_and_cleanup_existing
+    
+    # Tiếp tục với quy trình cài đặt
+    print_status "Bước 3: Cấu hình WireGuard"
     get_user_input
     check_existing_container
     create_docker_compose
