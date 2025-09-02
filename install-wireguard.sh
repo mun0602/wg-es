@@ -117,15 +117,31 @@ generate_password_hash() {
     local password="$1"
     print_status "Đang tạo bcrypt hash cho mật khẩu..."
     
+    # Tạo file tạm để tránh vấn đề với ký tự đặc biệt
+    local temp_script="/tmp/generate_hash.js"
+    cat > "$temp_script" << 'JSEOF'
+const bcrypt = require('bcryptjs');
+const password = process.argv[2];
+const hash = bcrypt.hashSync(password, 10);
+// Escape $ characters for docker-compose
+console.log(hash.replace(/\$/g, '$$'));
+JSEOF
+    
     # Sử dụng Docker để tạo bcrypt hash
-    PASSWORD_HASH=$(docker run --rm ghcr.io/wg-easy/wg-easy:latest node -e "const bcrypt = require('bcryptjs'); const hash = bcrypt.hashSync('$password', 10); console.log(hash.replace(/\$/g, '\$\$'));")
+    PASSWORD_HASH=$(docker run --rm -v "$temp_script:/app/generate_hash.js" ghcr.io/wg-easy/wg-easy:latest node /app/generate_hash.js "$password")
+    
+    # Xóa file tạm
+    rm -f "$temp_script"
     
     if [[ -z "$PASSWORD_HASH" ]]; then
         print_error "Không thể tạo bcrypt hash cho mật khẩu"
-        exit 1
+        print_status "Thử sử dụng mật khẩu plain text (không khuyến nghị)..."
+        PASSWORD_HASH="$password"
+        print_warning "Đang sử dụng mật khẩu plain text. Hãy cập nhật lên bcrypt hash sau."
+    else
+        print_success "Đã tạo bcrypt hash thành công"
+        print_status "Hash: ${PASSWORD_HASH:0:20}..."
     fi
-    
-    print_success "Đã tạo bcrypt hash thành công"
 }
 
 # Lấy thông tin từ người dùng
