@@ -112,6 +112,22 @@ install_docker_compose() {
     print_success "Docker Compose đã được cài đặt thành công"
 }
 
+# Tạo bcrypt hash cho mật khẩu
+generate_password_hash() {
+    local password="$1"
+    print_status "Đang tạo bcrypt hash cho mật khẩu..."
+    
+    # Sử dụng Docker để tạo bcrypt hash
+    PASSWORD_HASH=$(docker run --rm ghcr.io/wg-easy/wg-easy:latest node -e "const bcrypt = require('bcryptjs'); const hash = bcrypt.hashSync('$password', 10); console.log(hash.replace(/\$/g, '\$\$'));")
+    
+    if [[ -z "$PASSWORD_HASH" ]]; then
+        print_error "Không thể tạo bcrypt hash cho mật khẩu"
+        exit 1
+    fi
+    
+    print_success "Đã tạo bcrypt hash thành công"
+}
+
 # Lấy thông tin từ người dùng
 get_user_input() {
     echo
@@ -139,6 +155,9 @@ get_user_input() {
         exit 1
     fi
     
+    # Tạo bcrypt hash cho mật khẩu
+    generate_password_hash "$ADMIN_PASSWORD"
+    
     # Lấy IP công khai
     print_status "Đang lấy địa chỉ IP công khai..."
     PUBLIC_IP=$(curl -s ifconfig.me || curl -s ipinfo.io/ip || curl -s icanhazip.com)
@@ -158,15 +177,13 @@ create_docker_compose() {
     cd /opt/wireguard
     
     cat > docker-compose.yml << EOF
-version: '3.8'
-
 services:
   ${CONTAINER_NAME}:
     image: 'ghcr.io/wg-easy/wg-easy:latest'
     container_name: ${CONTAINER_NAME}
     environment:
       - WG_HOST=${PUBLIC_IP}
-      - PASSWORD=${ADMIN_PASSWORD}
+      - PASSWORD_HASH=${PASSWORD_HASH}
       - WG_PORT=${WG_PORT}
       - WG_DEFAULT_ADDRESS=10.8.0.x
       - WG_DEFAULT_DNS=1.1.1.1
